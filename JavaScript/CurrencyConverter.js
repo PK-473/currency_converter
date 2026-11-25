@@ -25,7 +25,9 @@ CurrencyConverter.Constants = {
         ConversionResult: "cc_conversionresult",
         LastConversionDate: "cc_lastconversiondate",
         ApiStatus: "cc_apistatus",
-        ApiErrorMessage: "cc_apierrormessage"
+        ApiErrorMessage: "cc_apierrormessage",
+        UsdRatesCache: "cc_usdratescache",
+        CacheExpiryUtc: "cc_cacheexpiryutc"
     },
 
     EnvironmentVariables: {
@@ -119,6 +121,7 @@ CurrencyConverter.onSave = async function (executionContext) {
         // Retrieve exchange-rate information
         var data =
             await CurrencyConverter.getExchangeRateData(
+                formContext,
                 convertFrom,
                 apiBaseUrl
             );
@@ -240,23 +243,28 @@ CurrencyConverter.validateInput =
         amount
     ) {
 
+        var currencyRegex =
+            /^[A-Z]{3}$/;
+
         if (
-            !convertFrom ||
-            convertFrom.length !== 3
+            !currencyRegex.test(
+                convertFrom
+            )
         ) {
 
             throw new Error(
-                "Convert From must be a valid 3-character currency code."
+                "Convert From must contain exactly 3 alphabetic characters (Example: USD, INR, EUR)."
             );
         }
 
         if (
-            !convertTo ||
-            convertTo.length !== 3
+            !currencyRegex.test(
+                convertTo
+            )
         ) {
 
             throw new Error(
-                "Convert To must be a valid 3-character currency code."
+                "Convert To must contain exactly 3 alphabetic characters (Example: USD, INR, EUR)."
             );
         }
 
@@ -271,38 +279,56 @@ CurrencyConverter.validateInput =
             );
         }
     };
-
 /**
  * Retrieves exchange-rate information.
  * Uses cache when data already exists.
  */
 CurrencyConverter.getExchangeRateData =
     async function (
+        formContext,
         convertFrom,
         apiBaseUrl
     ) {
 
+        var cacheAttribute =
+            formContext.getAttribute(
+                CurrencyConverter.Constants.Fields.UsdRatesCache
+            );
+
+        var expiryAttribute =
+            formContext.getAttribute(
+                CurrencyConverter.Constants.Fields.CacheExpiryUtc
+            );
+
+        var cachedJson =
+            cacheAttribute?.getValue();
+
+        var cacheExpiry =
+            expiryAttribute?.getValue();
+
         if (
-            CurrencyConverter.ExchangeRateCache[convertFrom]
+            cachedJson &&
+            cacheExpiry &&
+            new Date(cacheExpiry) > new Date()
         ) {
 
             console.log(
-                "Using cached exchange-rate data for " +
-                convertFrom
+                "Using Dataverse cache."
             );
 
-            return CurrencyConverter
-                .ExchangeRateCache[convertFrom];
+            return JSON.parse(
+                cachedJson
+            );
         }
+
+        console.log(
+            "Cache expired. Calling API."
+        );
 
         var apiUrl =
             apiBaseUrl +
             "/" +
             convertFrom;
-
-        console.log(
-            "Fetching exchange rates from API..."
-        );
 
         var response =
             await fetch(apiUrl);
@@ -318,9 +344,20 @@ CurrencyConverter.getExchangeRateData =
         var data =
             await response.json();
 
-        CurrencyConverter.ExchangeRateCache[
-            convertFrom
-        ] = data;
+        cacheAttribute.setValue(
+            JSON.stringify(data)
+        );
+
+        var expiryDate =
+            new Date();
+
+        expiryDate.setMinutes(
+            expiryDate.getMinutes() + 60
+        );
+
+        expiryAttribute.setValue(
+            expiryDate
+        );
 
         return data;
     };
@@ -334,35 +371,47 @@ CurrencyConverter.updateSuccessFields =
         convertedAmount
     ) {
 
-        formContext
-            .getAttribute(
+        var conversionResult =
+            formContext.getAttribute(
                 CurrencyConverter.Constants.Fields.ConversionResult
-            )
-            .setValue(
+            );
+
+        var lastConversionDate =
+            formContext.getAttribute(
+                CurrencyConverter.Constants.Fields.LastConversionDate
+            );
+
+        var apiStatus =
+            formContext.getAttribute(
+                CurrencyConverter.Constants.Fields.ApiStatus
+            );
+
+        var apiErrorMessage =
+            formContext.getAttribute(
+                CurrencyConverter.Constants.Fields.ApiErrorMessage
+            );
+
+        if (conversionResult) {
+            conversionResult.setValue(
                 convertedAmount
             );
+        }
 
-        formContext
-            .getAttribute(
-                CurrencyConverter.Constants.Fields.LastConversionDate
-            )
-            .setValue(
+        if (lastConversionDate) {
+            lastConversionDate.setValue(
                 new Date()
             );
+        }
 
-        formContext
-            .getAttribute(
-                CurrencyConverter.Constants.Fields.ApiStatus
-            )
-            .setValue(
+        if (apiStatus) {
+            apiStatus.setValue(
                 CurrencyConverter.Constants.ApiStatus.Success
             );
+        }
 
-        formContext
-            .getAttribute(
-                CurrencyConverter.Constants.Fields.ApiErrorMessage
-            )
-            .setValue("");
+        if (apiErrorMessage) {
+            apiErrorMessage.setValue("");
+        }
     };
 
 /**
@@ -374,21 +423,27 @@ CurrencyConverter.updateFailureFields =
         errorMessage
     ) {
 
-        formContext
-            .getAttribute(
+        var apiStatus =
+            formContext.getAttribute(
                 CurrencyConverter.Constants.Fields.ApiStatus
-            )
-            .setValue(
-                CurrencyConverter.Constants.ApiStatus.Failed
             );
 
-        formContext
-            .getAttribute(
+        var apiErrorMessage =
+            formContext.getAttribute(
                 CurrencyConverter.Constants.Fields.ApiErrorMessage
-            )
-            .setValue(
+            );
+
+        if (apiStatus) {
+            apiStatus.setValue(
+                CurrencyConverter.Constants.ApiStatus.Failed
+            );
+        }
+
+        if (apiErrorMessage) {
+            apiErrorMessage.setValue(
                 errorMessage
             );
+        }
     };
 
 /**
@@ -397,7 +452,7 @@ CurrencyConverter.updateFailureFields =
  * Falls back to Default Value.
  */
 CurrencyConverter.getEnvironmentVariable =
-    async function (schemaName) {   
+    async function (schemaName) {
 
         var query =
             "?$select=schemaname,defaultvalue" +
