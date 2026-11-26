@@ -25,9 +25,7 @@ CurrencyConverter.Constants = {
         ConversionResult: "cc_conversionresult",
         LastConversionDate: "cc_lastconversiondate",
         ApiStatus: "cc_apistatus",
-        ApiErrorMessage: "cc_apierrormessage",
-        UsdRatesCache: "cc_usdratescache",
-        CacheExpiryUtc: "cc_cacheexpiryutc"
+        ApiErrorMessage: "cc_apierrormessage"
     },
 
     EnvironmentVariables: {
@@ -36,24 +34,31 @@ CurrencyConverter.Constants = {
     },
 
     NotificationIds: {
-        CurrencyError: "CurrencyError"
+        CurrencyError: "CurrencyError",
+        CacheWarning: "CacheWarning"
+    },
+    CacheTable: {
+        EntityName: "cc_exchangeratecache",
+        BaseCurrency: "cc_name",
+        CachedResponse: "cc_cachedresponse",
+        CachedExpiryUtc: "cc_cachedexpiryutc",
+        LastSuccessfulRefreshUtc:
+            "cc_lastsuccessfulrefreshutc"
     }
 };
 
-/**
- * In-memory cache.
- * Cache key = Source Currency
- * Example:
- * {
- *      "USD": { API Response },
- *      "EUR": { API Response }
- * }
- */
-CurrencyConverter.ExchangeRateCache = {};
+
 
 /**
- * Main OnSave Handler.
- * Executes only when Convert Using = JavaScript.
+ * Main OnSave handler.
+ *
+ * Process Flow:
+ * 1. Runs only when "Convert Using" = JavaScript.
+ * 2. Validates user-entered values.
+ * 3. Retrieves exchange-rate data from cache or API.
+ * 4. Performs currency conversion.
+ * 5. Updates result and audit fields.
+ * 6. Prevents save if no exchange-rate data is available.
  */
 CurrencyConverter.onSave = async function (executionContext) {
 
@@ -66,6 +71,10 @@ CurrencyConverter.onSave = async function (executionContext) {
 
         formContext.ui.clearFormNotification(
             CurrencyConverter.Constants.NotificationIds.CurrencyError
+        );
+
+        formContext.ui.clearFormNotification(
+            CurrencyConverter.Constants.NotificationIds.CacheWarning
         );
 
         // Retrieve all required attributes
@@ -172,41 +181,56 @@ CurrencyConverter.onSave = async function (executionContext) {
     }
     catch (error) {
 
-        if (
-            CurrencyConverter.isValidationError(
-                error.message
-            )
-        ) {
+    console.error(error);
 
-            saveEventArgs.preventDefault();
+    saveEventArgs.preventDefault();
 
-            CurrencyConverter.clearResultFields(
-                formContext
-            );
-
-            formContext.ui.setFormNotification(
-                error.message,
-                "ERROR",
-                CurrencyConverter.Constants.NotificationIds.CurrencyError
-            );
-
-            return;
-        }
-
-        console.error(error);
-
-        CurrencyConverter.updateFailureFields(
-            formContext,
+    if (
+        CurrencyConverter.isValidationError(
             error.message
-        );
+        )
+    ) {
 
         formContext.ui.setFormNotification(
             error.message,
             "ERROR",
             CurrencyConverter.Constants.NotificationIds.CurrencyError
         );
+
+        return;
     }
+
+    CurrencyConverter.clearResultFields(
+        formContext
+    );
+
+    CurrencyConverter.updateFailureFields(
+        formContext,
+        error.message
+    );
+
+    formContext.ui.setFormNotification(
+        error.message,
+        "ERROR",
+        CurrencyConverter.Constants.NotificationIds.CurrencyError
+    );
+}
 };
+
+/**
+ * Determines whether the error was caused by
+ * user-entered validation failures rather than
+ * an API or system error.
+ */
+CurrencyConverter.isValidationError =
+    function (errorMessage) {
+
+        return (
+            errorMessage.includes("Convert From") ||
+            errorMessage.includes("Convert To") ||
+            errorMessage.includes("Amount")
+        );
+    };
 
 /**
  * Retrieves frequently used form attributes.
@@ -305,7 +329,30 @@ CurrencyConverter.validateInput =
     };
 /**
  * Retrieves exchange-rate information.
- * Uses cache when data already exists.
+ *
+ * Strategy:
+ * --------------------------
+ * Valid Cache
+ *      -> Use cache
+ *
+ * Expired Cache
+ *      -> Call API
+ *
+ * API Success
+ *      -> Update cache
+ *
+ * API Failure + Existing Cache
+ *      -> Use stale cache
+ *
+ * API Failure + No Cache
+ *      -> Throw error
+ * --------------------------
+ *
+ * This design protects the solution from:
+ * - API downtime
+ * - Network issues
+ * - API rate limiting
+ * - Incorrect time_next_update_utc values
  */
 CurrencyConverter.getExchangeRateData =
     async function (
@@ -314,90 +361,145 @@ CurrencyConverter.getExchangeRateData =
         apiBaseUrl
     ) {
 
-        var cacheAttribute =
-            formContext.getAttribute(
-                CurrencyConverter.Constants.Fields.UsdRatesCache
+        // Try to retrieve an existing cache record
+        var cacheRecord =
+            await CurrencyConverter.getCacheRecord(
+                convertFrom
             );
 
-        var expiryAttribute =
-            formContext.getAttribute(
-                CurrencyConverter.Constants.Fields.CacheExpiryUtc
-            );
-
-        var cachedJson =
-            cacheAttribute?.getValue();
-
-        var cacheExpiry =
-            expiryAttribute?.getValue();
-
+        // Check whether the cache is still valid
         if (
-            cachedJson &&
-            cacheExpiry &&
-            new Date(cacheExpiry) > new Date()
+            cacheRecord &&
+            CurrencyConverter.isCacheValid(
+                cacheRecord
+            )
         ) {
-            var cachedData =
-                JSON.parse(cachedJson);
 
-            if (
-                cachedData.rates
-            ) {
-                console.log(
-                    "Using Dataverse cache."
+            console.log(
+                "Using valid cached exchange rate data."
+            );
+
+            try {
+                return JSON.parse(
+                    cacheRecord.cc_cachedresponse
                 );
-
-                return cachedData;
+            }
+            catch {
+                throw new Error(
+                    "Cached exchange-rate data is invalid."
+                );
             }
         }
 
         console.log(
-            "Cache expired. Calling API."
+            "Cache expired or not found. Calling API."
         );
 
-        var apiUrl =
-            apiBaseUrl +
-            "/" +
-            convertFrom;
+        try {
 
-        var response =
-            await fetch(apiUrl);
+            // Build the Exchange Rate API URL
+            var apiUrl =
+                apiBaseUrl +
+                "/" +
+                convertFrom;
 
-        if (!response.ok) {
+            // Call the external API
+            var response =
+                await fetch(apiUrl);
 
+            // Validate HTTP status
+            if (!response.ok) {
+
+                throw new Error(
+                    "Exchange Rate API returned HTTP status " +
+                    response.status
+                );
+            }
+
+            // Parse API response
+            var data =
+                await response.json();
+
+            // Validate API response
+            if (
+                data.result &&
+                data.result !== "success"
+            ) {
+
+                throw new Error(
+                    "Currency API returned: " +
+                    (
+                        data["error-type"] ||
+                        "Unknown error"
+                    )
+                );
+            }
+
+            // Cache record already exists
+            if (cacheRecord) {
+
+                await CurrencyConverter.updateCacheRecord(
+                    cacheRecord.cc_exchangeratecacheid,
+                    data
+                );
+            }
+            else {
+
+                await CurrencyConverter.createCacheRecord(
+                    convertFrom,
+                    data
+                );
+            }
+
+            console.log(
+                "Cache successfully refreshed."
+            );
+
+            return data;
+        }
+        catch (apiError) {
+
+            console.error(
+                "API call failed.",
+                apiError
+            );
+
+            // Fallback logic:
+            // If old cache exists, use it even if expired.
+            if (
+                cacheRecord &&
+                cacheRecord.cc_cachedresponse
+            ) {
+
+                formContext.ui.setFormNotification(
+                    "Live exchange rates could not be retrieved. Using previously cached exchange rates.",
+                    "WARNING",
+                    CurrencyConverter.Constants.NotificationIds.CacheWarning
+                );
+
+                console.log(
+                    "Using stale cache because API call failed."
+                );
+
+                try {
+
+                    return JSON.parse(
+                        cacheRecord.cc_cachedresponse
+                    );
+                }
+                catch {
+
+                    throw new Error(
+                        "Cached exchange-rate data is invalid."
+                    );
+                }
+            }
+
+            // No cache available
             throw new Error(
-                "API returned status " +
-                response.status
+                "Unable to retrieve exchange rates and no cached exchange rates are available."
             );
         }
-
-        var data =
-            await response.json();
-
-        if (
-            data.result &&
-            data.result !== "success"
-        ) {
-            throw new Error(
-                "Currency API returned: " +
-                (data["error-type"] || "Unknown error")
-            );
-        }
-
-        cacheAttribute.setValue(
-            JSON.stringify(data)
-        );
-
-        var expiryDate =
-            new Date();
-
-        expiryDate.setMinutes(
-            expiryDate.getMinutes() + 60
-        );
-
-        expiryAttribute.setValue(
-            expiryDate
-        );
-
-        return data;
     };
 
 /**
@@ -428,6 +530,14 @@ CurrencyConverter.updateSuccessFields =
             formContext.getAttribute(
                 CurrencyConverter.Constants.Fields.ApiErrorMessage
             );
+
+        formContext.ui.clearFormNotification(
+            CurrencyConverter.Constants.NotificationIds.CurrencyError
+        );
+
+        formContext.ui.clearFormNotification(
+            CurrencyConverter.Constants.NotificationIds.CacheWarning
+        );
 
         if (conversionResult) {
             conversionResult.setValue(
@@ -527,16 +637,6 @@ CurrencyConverter.getEnvironmentVariable =
         return envVar.defaultvalue;
     };
 
-CurrencyConverter.isValidationError =
-    function (errorMessage) {
-
-        return (
-            errorMessage.includes("Convert From") ||
-            errorMessage.includes("Convert To") ||
-            errorMessage.includes("Amount")
-        );
-    };
-
 CurrencyConverter.clearResultFields =
     function (formContext) {
 
@@ -551,4 +651,116 @@ CurrencyConverter.clearResultFields =
                 CurrencyConverter.Constants.Fields.LastConversionDate
             )
             ?.setValue(null);
+    };
+
+CurrencyConverter.getCacheRecord =
+    async function (baseCurrency) {
+
+        var query =
+            "?$select=" +
+            [
+                "cc_exchangeratecacheid",
+                CurrencyConverter.Constants.CacheTable.BaseCurrency,
+                CurrencyConverter.Constants.CacheTable.CachedResponse,
+                CurrencyConverter.Constants.CacheTable.CachedExpiryUtc,
+                CurrencyConverter.Constants.CacheTable.LastSuccessfulRefreshUtc
+            ].join(",") +
+            "&$filter=" +
+            CurrencyConverter.Constants.CacheTable.BaseCurrency +
+            " eq '" +
+            baseCurrency.replace(/'/g, "''") +
+            "'" +
+            "&$top=1";
+
+        var result =
+            await Xrm.WebApi.retrieveMultipleRecords(
+                CurrencyConverter.Constants.CacheTable.EntityName,
+                query
+            );
+
+        return result.entities.length > 0
+            ? result.entities[0]
+            : null;
+    };
+
+CurrencyConverter.isCacheValid =
+    function (cacheRecord) {
+
+        if (
+            !cacheRecord ||
+            !cacheRecord.cc_cachedexpiryutc
+        ) {
+            return false;
+        }
+
+        return (
+            new Date(cacheRecord.cc_cachedexpiryutc) >
+            new Date()
+        );
+    };
+
+CurrencyConverter.createCacheRecord =
+    async function (
+        baseCurrency,
+        apiResponse
+    ) {
+
+        var now =
+            new Date();
+
+        var expiry =
+            new Date();
+
+        expiry.setHours(
+            expiry.getHours() + 24
+        );
+
+        var payload = {
+            cc_name: baseCurrency,
+            cc_cachedresponse:
+                JSON.stringify(apiResponse),
+            cc_cachedexpiryutc:
+                expiry.toISOString(),
+            cc_lastsuccessfulrefreshutc:
+                now.toISOString()
+        };
+
+        await Xrm.WebApi.createRecord(
+            "cc_exchangeratecache",
+            payload
+        );
+    };
+
+CurrencyConverter.updateCacheRecord =
+    async function (
+        recordId,
+        apiResponse
+    ) {
+
+        var now =
+            new Date();
+
+        var expiry =
+            new Date();
+
+        expiry.setHours(
+            expiry.getHours() + 24
+        );
+
+        var payload = {
+            cc_cachedresponse:
+                JSON.stringify(apiResponse),
+
+            cc_cachedexpiryutc:
+                expiry.toISOString(),
+
+            cc_lastsuccessfulrefreshutc:
+                now.toISOString()
+        };
+
+        await Xrm.WebApi.updateRecord(
+            "cc_exchangeratecache",
+            recordId,
+            payload
+        );
     };
