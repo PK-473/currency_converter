@@ -57,7 +57,10 @@ CurrencyConverter.ExchangeRateCache = {};
  */
 CurrencyConverter.onSave = async function (executionContext) {
 
-    var formContext = executionContext.getFormContext();
+    var formContext =
+        executionContext.getFormContext();
+    var saveEventArgs =
+        executionContext.getEventArgs();
 
     try {
 
@@ -168,6 +171,27 @@ CurrencyConverter.onSave = async function (executionContext) {
         );
     }
     catch (error) {
+
+        if (
+            CurrencyConverter.isValidationError(
+                error.message
+            )
+        ) {
+
+            saveEventArgs.preventDefault();
+
+            CurrencyConverter.clearResultFields(
+                formContext
+            );
+
+            formContext.ui.setFormNotification(
+                error.message,
+                "ERROR",
+                CurrencyConverter.Constants.NotificationIds.CurrencyError
+            );
+
+            return;
+        }
 
         console.error(error);
 
@@ -311,14 +335,18 @@ CurrencyConverter.getExchangeRateData =
             cacheExpiry &&
             new Date(cacheExpiry) > new Date()
         ) {
+            var cachedData =
+                JSON.parse(cachedJson);
 
-            console.log(
-                "Using Dataverse cache."
-            );
+            if (
+                cachedData.rates
+            ) {
+                console.log(
+                    "Using Dataverse cache."
+                );
 
-            return JSON.parse(
-                cachedJson
-            );
+                return cachedData;
+            }
         }
 
         console.log(
@@ -343,6 +371,16 @@ CurrencyConverter.getExchangeRateData =
 
         var data =
             await response.json();
+
+        if (
+            data.result &&
+            data.result !== "success"
+        ) {
+            throw new Error(
+                "Currency API returned: " +
+                (data["error-type"] || "Unknown error")
+            );
+        }
 
         cacheAttribute.setValue(
             JSON.stringify(data)
@@ -487,4 +525,30 @@ CurrencyConverter.getEnvironmentVariable =
         }
 
         return envVar.defaultvalue;
+    };
+
+CurrencyConverter.isValidationError =
+    function (errorMessage) {
+
+        return (
+            errorMessage.includes("Convert From") ||
+            errorMessage.includes("Convert To") ||
+            errorMessage.includes("Amount")
+        );
+    };
+
+CurrencyConverter.clearResultFields =
+    function (formContext) {
+
+        formContext
+            .getAttribute(
+                CurrencyConverter.Constants.Fields.ConversionResult
+            )
+            ?.setValue(null);
+
+        formContext
+            .getAttribute(
+                CurrencyConverter.Constants.Fields.LastConversionDate
+            )
+            ?.setValue(null);
     };
